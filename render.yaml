@@ -1,7 +1,6 @@
 services:
   - type: web
     name: animal-workspace-ffmpeg
-    env: node
-    buildCommand: npm install && apt-get install -y ffmpeg
-    startCommand: node server.js
+    env: docker
+    dockerfilePath: ./Dockerfile
     plan: free
