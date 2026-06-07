@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: animal-workspace-ffmpeg
+    env: node
+    buildCommand: npm install && apt-get install -y ffmpeg
+    startCommand: node server.js
+    plan: free
