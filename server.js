@@ -6,7 +6,16 @@ const { execSync } = require('child_process');
 const crypto = require('crypto');
 
 const app = express();
+
+// Handle both JSON objects and JSON strings from n8n
 app.use(express.json({ limit: '50mb' }));
+app.use(express.text({ limit: '50mb', type: 'application/json' }));
+app.use((req, res, next) => {
+  if (typeof req.body === 'string') {
+    try { req.body = JSON.parse(req.body); } catch(e) {}
+  }
+  next();
+});
 
 const TMP = '/tmp/aw';
 if (!fs.existsSync(TMP)) fs.mkdirSync(TMP, { recursive: true });
@@ -36,16 +45,22 @@ function normalizeClip(inputMp4, outputMp4) {
   execSync(`ffmpeg -y -i "${inputMp4}" -c:v libx264 -pix_fmt yuv420p -vf "scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2" -r 30 -c:a aac -ar 44100 -ac 2 "${outputMp4}"`);
 }
 
-app.get('/health', (req, res) => res.json({ status: 'ok', service: 'animal-workspace-ffmpeg' }));
+// Health check
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', service: 'animal-workspace-ffmpeg' });
+});
 
-// Generate Kling image — called by n8n instead of calling Kling directly
+// Generate Kling character image
 app.post('/kling/image', async (req, res) => {
   try {
+    console.log('Received body type:', typeof req.body);
+    console.log('Received body:', JSON.stringify(req.body));
     const { access_key, secret_key, prompt } = req.body;
     if (!access_key || !secret_key || !prompt) {
-      return res.status(400).json({ error: 'access_key, secret_key, and prompt are required' });
+      return res.status(400).json({ error: 'access_key, secret_key, and prompt are required', received: req.body });
     }
     const token = generateKlingJWT(access_key, secret_key);
+    console.log('Generated JWT, calling Kling image API...');
     const response = await axios.post('https://api.klingai.com/v1/images/generations', {
       model: 'kling-v1',
       prompt: prompt,
@@ -59,7 +74,7 @@ app.post('/kling/image', async (req, res) => {
       timeout: 30000
     });
     console.log('Kling image response:', JSON.stringify(response.data));
-    res.json({ ...response.data, jwt_token: token });
+    res.json(response.data);
   } catch (err) {
     const errData = err.response?.data || err.message;
     console.error('Kling image error:', JSON.stringify(errData));
@@ -71,6 +86,9 @@ app.post('/kling/image', async (req, res) => {
 app.post('/kling/image/status', async (req, res) => {
   try {
     const { access_key, secret_key, task_id } = req.body;
+    if (!access_key || !secret_key || !task_id) {
+      return res.status(400).json({ error: 'access_key, secret_key, and task_id are required' });
+    }
     const token = generateKlingJWT(access_key, secret_key);
     const response = await axios.get(`https://api.klingai.com/v1/images/generations/${task_id}`, {
       headers: { 'Authorization': `Bearer ${token}` },
@@ -85,7 +103,7 @@ app.post('/kling/image/status', async (req, res) => {
   }
 });
 
-// Generate all 4 video shots — called by n8n with all shot prompts at once
+// Submit all 4 video shot requests
 app.post('/kling/videos', async (req, res) => {
   try {
     const { access_key, secret_key, character_image_url, shots } = req.body;
@@ -95,6 +113,7 @@ app.post('/kling/videos', async (req, res) => {
     const token = generateKlingJWT(access_key, secret_key);
     const taskIds = [];
     for (const shot of shots) {
+      console.log(`Submitting shot ${shot.shot_number}...`);
       const response = await axios.post('https://api.klingai.com/v1/videos/image2video', {
         model_name: 'kling-v1',
         prompt: shot.prompt,
@@ -128,6 +147,9 @@ app.post('/kling/videos', async (req, res) => {
 app.post('/kling/videos/status', async (req, res) => {
   try {
     const { access_key, secret_key, task_ids } = req.body;
+    if (!access_key || !secret_key || !task_ids) {
+      return res.status(400).json({ error: 'access_key, secret_key, and task_ids are required' });
+    }
     const token = generateKlingJWT(access_key, secret_key);
     const results = [];
     for (const task of task_ids) {
@@ -150,7 +172,7 @@ app.post('/kling/videos/status', async (req, res) => {
   }
 });
 
-// Stitch video
+// Stitch video with FFmpeg
 app.post('/stitch', async (req, res) => {
   const jobId = Date.now().toString();
   const jobDir = path.join(TMP, jobId);
@@ -158,17 +180,22 @@ app.post('/stitch', async (req, res) => {
   try {
     const { intro_url, outro_url, clip_urls, title } = req.body;
     if (!intro_url || !outro_url || !clip_urls || clip_urls.length === 0) {
-      return res.status(400).json({ error: 'Missing required fields' });
+      return res.status(400).json({ error: 'Missing required fields: intro_url, outro_url, clip_urls' });
     }
     console.log(`[${jobId}] Stitching: ${title}`);
+
     const introPng = path.join(jobDir, 'intro.png');
     await downloadFile(intro_url, introPng);
+
     const outroPng = path.join(jobDir, 'outro.png');
     await downloadFile(outro_url, outroPng);
+
     const introMp4 = path.join(jobDir, 'intro.mp4');
     pngToVideo(introPng, introMp4, 2);
+
     const outroMp4 = path.join(jobDir, 'outro.mp4');
     pngToVideo(outroPng, outroMp4, 3);
+
     const normalizedClips = [];
     for (let i = 0; i < clip_urls.length; i++) {
       const rawClip = path.join(jobDir, `raw_${i}.mp4`);
@@ -177,19 +204,25 @@ app.post('/stitch', async (req, res) => {
       normalizeClip(rawClip, normClip);
       normalizedClips.push(normClip);
     }
+
     const concatList = path.join(jobDir, 'concat.txt');
     const allClips = [introMp4, ...normalizedClips, outroMp4];
     fs.writeFileSync(concatList, allClips.map(f => `file '${f}'`).join('\n'));
+
     const finalMp4 = path.join(jobDir, 'final.mp4');
     execSync(`ffmpeg -y -f concat -safe 0 -i "${concatList}" -c:v libx264 -c:a aac -pix_fmt yuv420p -movflags +faststart "${finalMp4}"`);
+
     const stat = fs.statSync(finalMp4);
-    console.log(`[${jobId}] Done. Size: ${(stat.size/1024/1024).toFixed(2)}MB`);
+    console.log(`[${jobId}] Done. Size: ${(stat.size / 1024 / 1024).toFixed(2)}MB`);
+
     res.setHeader('Content-Type', 'video/mp4');
     res.setHeader('Content-Disposition', `attachment; filename="${jobId}.mp4"`);
     res.setHeader('Content-Length', stat.size);
+
     const stream = fs.createReadStream(finalMp4);
     stream.pipe(res);
     stream.on('end', () => fs.rmSync(jobDir, { recursive: true, force: true }));
+
   } catch (err) {
     console.error(`[${jobId}] Error:`, err.message);
     fs.rmSync(jobDir, { recursive: true, force: true });
@@ -198,4 +231,4 @@ app.post('/stitch', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Animal Workspace FFmpeg server running on port ${PORT}`));
